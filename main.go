@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
@@ -27,6 +29,8 @@ type containerInfo struct {
 	Name           string
 	NetworkSummary *netInfo
 }
+
+type contanierInfoMap map[string]containerInfo
 
 func parseContainerName(original []string) (string, error) {
 	if len(original) < 1 {
@@ -89,8 +93,8 @@ func netstat() (*netInfo, error) {
 
 // Collects all network information from all running contaniers and
 // returns them in a map where the keys are the contanier IDs
-func collectInfo(cli *client.Client) (map[string]containerInfo, error) {
-	result := make(map[string]containerInfo)
+func collectInfo(cli *client.Client) (contanierInfoMap, error) {
+	result := make(contanierInfoMap)
 	context := context.Background()
 
 	containers, err := cli.ContainerList(context, types.ContainerListOptions{})
@@ -151,24 +155,32 @@ func collectInfo(cli *client.Client) (map[string]containerInfo, error) {
 	return result, nil
 }
 
+var containerMap atomic.Value // holds current contanier information
+func collector(cli *client.Client) {
+	for {
+		currentContainerMap, err := collectInfo(cli)
+		if err == nil {
+			containerMap.Store(currentContainerMap)
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
 func metrics(cli *client.Client, w http.ResponseWriter, req *http.Request) error {
 	const SentCounterName = "docker_network_sent_bytes_total"
 	const ReceivedCounterName = "docker_network_received_bytes_total"
 	const MetricHeaderFormat = "# HELP %[1]s\n# TYPE %[1]s counter\n"
 	const MetricFormat = "%s{container=\"%s\"} %d\n"
 
-	containerMap, err := collectInfo(cli)
-	if err != nil {
-		return err
-	}
+	currentContainerMap := containerMap.Load().(contanierInfoMap)
 
 	fmt.Fprintf(w, MetricHeaderFormat, ReceivedCounterName)
-	for _, container := range containerMap {
+	for _, container := range currentContainerMap {
 		fmt.Fprintf(w, MetricFormat, ReceivedCounterName, container.Name, container.NetworkSummary.InOctets)
 	}
 
 	fmt.Fprintf(w, MetricHeaderFormat, SentCounterName)
-	for _, container := range containerMap {
+	for _, container := range currentContainerMap {
 		fmt.Fprintf(w, MetricFormat, SentCounterName, container.Name, container.NetworkSummary.OutOctets)
 	}
 
@@ -182,6 +194,8 @@ func main() {
 		panic(err)
 	}
 	cli.NegotiateAPIVersion(ctx)
+
+	go collector(cli)
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		if err := metrics(cli, w, r); err != nil {
