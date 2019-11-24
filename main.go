@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"docker-prometheus-exporter/configuration"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,24 +42,33 @@ func parseContainerName(original []string) (string, error) {
 
 // Collects all network information from all running containers and
 // returns them in a map where the keys are the contanier IDs
-func collectInfo(cli *client.Client) (contanierInfoMap, error) {
+func collectInfo(config *configuration.Configuration) (contanierInfoMap, error) {
 	result := make(contanierInfoMap)
-	context := context.Background()
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		panic(err)
+	}
+	cli.NegotiateAPIVersion(ctx)
 
-	containers, err := cli.ContainerList(context, types.ContainerListOptions{})
+	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	for _, container := range containers {
-		name, err := parseContainerName(container.Names)
-		if err != nil {
-			log.Println(fmt.Errorf("Error while parsing container names %v for container %v: %v",
-				container.Names, container.ID, err))
-			continue
+		name := container.Names[0]
+		var err error
+		if !config.SkipNameProcessing {
+			name, err = parseContainerName(container.Names)
+			if err != nil {
+				log.Println(fmt.Errorf("Error while parsing container names %v for container %v: %v",
+					container.Names, container.ID, err))
+				continue
+			}
 		}
 
-		stats, err := cli.ContainerStats(context, container.ID, false)
+		stats, err := cli.ContainerStats(ctx, container.ID, false)
 		if err != nil {
 			log.Println(fmt.Errorf("Error while getting stats of container %v: %v",
 				container.ID, err))
@@ -85,9 +95,9 @@ func collectInfo(cli *client.Client) (contanierInfoMap, error) {
 }
 
 var containerMap atomic.Value // holds current contanier information
-func collector(cli *client.Client) {
+func collector(config *configuration.Configuration) {
 	for {
-		currentContainerMap, err := collectInfo(cli)
+		currentContainerMap, err := collectInfo(config)
 		if err == nil {
 			containerMap.Store(currentContainerMap)
 		}
@@ -95,7 +105,7 @@ func collector(cli *client.Client) {
 	}
 }
 
-func metrics(cli *client.Client, w http.ResponseWriter, req *http.Request) error {
+func metrics(w http.ResponseWriter, req *http.Request) error {
 	const SentCounterName = "docker_network_sent_bytes_total"
 	const ReceivedCounterName = "docker_network_received_bytes_total"
 	const MetricHeaderFormat = "# HELP %[1]s\n# TYPE %[1]s counter\n"
@@ -119,20 +129,16 @@ func metrics(cli *client.Client, w http.ResponseWriter, req *http.Request) error
 }
 
 func main() {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		panic(err)
-	}
-	cli.NegotiateAPIVersion(ctx)
+	containerMap.Store(make(contanierInfoMap))
+	config := configuration.RetrieveConfiguration()
 
-	go collector(cli)
+	go collector(config)
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		if err := metrics(cli, w, r); err != nil {
+		if err := metrics(w, r); err != nil {
 			http.Error(w, err.Error(), 500)
 		}
 	})
 
-	log.Fatal(http.ListenAndServe(":8099", nil))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil))
 }
