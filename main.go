@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"docker-prometheus-exporter/configuration"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/cosenmarco/docker-prometheus-exporter/configuration"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
