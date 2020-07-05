@@ -2,144 +2,183 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
-	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/cosenmarco/docker-prometheus-exporter/configuration"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 )
 
-type netInfo struct {
-	InOctets  uint64
-	OutOctets uint64
-}
+// Enum for the health of running containers
+var healthStateMetric = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "docker_container_health",
+	Help: "Health check status of the container. 0 for n/a, 1 for starting, 2 for healthy, -1 for unhealthy",
+}, []string{"container_name"})
 
-type containerInfo struct {
-	ID             string
-	Name           string
-	NetworkSummary *types.StatsJSON
-}
+// Max (across all processes inside the container) open file descriptors per container
+var maxOpenFilesMetric = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "docker_container_max_open_files",
+	Help: "Momentary max (across all processes inside the container) open file descriptors per container",
+}, []string{"container_name"})
 
-type contanierInfoMap map[string]containerInfo
-
-func parseContainerName(original []string) (string, error) {
-	if len(original) < 1 {
-		return "", errors.New("No container names given")
+func healthCheckToGaugeValue(state string) float64 {
+	switch state {
+	case "starting":
+		return 1.0
+	case "unhealthy":
+		return -1.0
+	case "healthy":
+		return 2.0
+	default:
+		return -2.0
 	}
-	nameParts := strings.Split(original[0], "_")
-	if len(nameParts) < 2 {
-		return "", errors.New("Cannot find interesting container name part")
-	}
-	return nameParts[1], nil
 }
 
-// Collects all network information from all running containers and
-// returns them in a map where the keys are the contanier IDs
-func collectInfo(config *configuration.Configuration) (contanierInfoMap, error) {
-	result := make(contanierInfoMap)
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+func healthGaugeValueFromInspection(inspection types.ContainerJSON) float64 {
+	if inspection.State.Health != nil {
+		return healthCheckToGaugeValue(inspection.State.Health.Status)
+	}
+	return 0
+}
+
+// Counts the number of file descriptors by listing the /proc{pid}/fd directory
+func fetchOpenFilesCount(pid string) (int64, error) {
+	var count int64 = 0
+	files, err := ioutil.ReadDir("/proc/" + pid + "/fd")
+	if err != nil {
+		return 0, err
+	}
+	for _, file := range files {
+		if !file.IsDir() {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func max(x, y int64) int64 {
+	if x < y {
+		return y
+	}
+	return x
+}
+
+func maxOpenFilesGaugeValueFromTop(top container.ContainerTopOKBody, cli *client.Client, ctx *context.Context) (float64, error) {
+	var maxOpenFiles int64 = 0
+	for i := 0; i < len(top.Processes); i++ {
+		pid := top.Processes[i][1]
+		openFiles, err := fetchOpenFilesCount(pid)
+		if err != nil {
+			return 0, err
+		}
+		maxOpenFiles = max(maxOpenFiles, openFiles)
+	}
+	return float64(maxOpenFiles), nil
+}
+
+func collectInfo(config *configuration.Configuration, cli *client.Client, ctx *context.Context) {
+	containers, err := cli.ContainerList(*ctx, types.ContainerListOptions{
+		All: true, // We want to delete gauges for non-running containers
+	})
+
 	if err != nil {
 		panic(err)
-	}
-	cli.NegotiateAPIVersion(ctx)
-
-	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{})
-	if err != nil {
-		return nil, err
 	}
 
 	for _, container := range containers {
 		name := container.Names[0]
 		var err error
-		if !config.SkipNameProcessing {
-			name, err = parseContainerName(container.Names)
+
+		inspection, err := cli.ContainerInspect(*ctx, container.ID)
+		if err != nil {
+			log.Println(fmt.Errorf("Error while inspecting container %v: %v",
+				container.ID, err))
+			continue
+		}
+
+		if inspection.State.Running {
+			healthGauge, err := healthStateMetric.GetMetricWithLabelValues(name)
 			if err != nil {
-				log.Println(fmt.Errorf("Error while parsing container names %v for container %v: %v",
-					container.Names, container.ID, err))
+				log.Println(fmt.Errorf("can't get health gauge for container %v: %v",
+					container.ID, err))
 				continue
 			}
-		}
+			healthGauge.Set(healthGaugeValueFromInspection(inspection))
 
-		stats, err := cli.ContainerStats(ctx, container.ID, false)
-		if err != nil {
-			log.Println(fmt.Errorf("Error while getting stats of container %v: %v",
-				container.ID, err))
-			continue
-		}
+			maxOpenFilesGauge, err := maxOpenFilesMetric.GetMetricWithLabelValues(name)
+			if err != nil {
+				log.Println(fmt.Errorf("can't get maxOpenFiles gauge for container %v: %v",
+					container.ID, err))
+				continue
+			}
 
-		var containerStats types.StatsJSON
-		err = json.NewDecoder(stats.Body).Decode(&containerStats)
-		stats.Body.Close()
-		if err != nil {
-			log.Println(fmt.Errorf("Error while reading and parsing stats of container %v: %v",
-				container.ID, err))
-			continue
-		}
+			top, err := cli.ContainerTop(*ctx, container.ID, []string{})
+			if err != nil {
+				log.Println(fmt.Errorf("can't perform top for container %v: %v",
+					container.ID, err))
+				continue
+			}
+			maxOpenFiles, err := maxOpenFilesGaugeValueFromTop(top, cli, ctx)
+			if err != nil {
+				log.Println(fmt.Errorf("can't count max open files for container %v: %v",
+					container.ID, err))
+				continue
+			}
+			maxOpenFilesGauge.Set(maxOpenFiles)
 
-		result[container.ID] = containerInfo{
-			ID:             container.ID,
-			Name:           name,
-			NetworkSummary: &containerStats,
+		} else {
+			healthStateMetric.DeleteLabelValues(name)
+			maxOpenFilesMetric.DeleteLabelValues(name)
 		}
 	}
-
-	return result, nil
 }
 
-var containerMap atomic.Value // holds current contanier information
 func collector(config *configuration.Configuration) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		panic(err)
+	}
+	defer cli.Close()
+	cli.NegotiateAPIVersion(ctx)
+
 	for {
-		currentContainerMap, err := collectInfo(config)
-		if err == nil {
-			containerMap.Store(currentContainerMap)
-		}
-		time.Sleep(5 * time.Second)
+		collectInfo(config, cli, &ctx)
+		time.Sleep(time.Duration(config.Interval) * time.Millisecond)
 	}
-}
-
-func metrics(w http.ResponseWriter, req *http.Request) error {
-	const SentCounterName = "docker_network_sent_bytes_total"
-	const ReceivedCounterName = "docker_network_received_bytes_total"
-	const MetricHeaderFormat = "# HELP %[1]s\n# TYPE %[1]s counter\n"
-	const MetricFormat = "%s{container=\"%s\"} %d\n"
-
-	currentContainerMap := containerMap.Load().(contanierInfoMap)
-
-	fmt.Fprintf(w, MetricHeaderFormat, ReceivedCounterName)
-	for _, container := range currentContainerMap {
-		fmt.Fprintf(w, MetricFormat, ReceivedCounterName, container.Name,
-			container.NetworkSummary.Networks["eth0"].RxBytes)
-	}
-
-	fmt.Fprintf(w, MetricHeaderFormat, SentCounterName)
-	for _, container := range currentContainerMap {
-		fmt.Fprintf(w, MetricFormat, SentCounterName, container.Name,
-			container.NetworkSummary.Networks["eth0"].TxBytes)
-	}
-
-	return nil
 }
 
 func main() {
-	containerMap.Store(make(contanierInfoMap))
 	config := configuration.RetrieveConfiguration()
+	registerer := prometheus.DefaultRegisterer
+	gatherer := prometheus.DefaultGatherer
+
+	if config.SuppressDefaultMetrics {
+		registry := prometheus.NewRegistry()
+		registerer = registry
+		gatherer = registry
+	}
+
+	registerer.MustRegister(healthStateMetric)
+	registerer.MustRegister(maxOpenFilesMetric)
 
 	go collector(config)
 
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		if err := metrics(w, r); err != nil {
-			http.Error(w, err.Error(), 500)
-		}
-	})
+	http.Handle(*config.MetricsPath, promhttp.HandlerFor(
+		gatherer,
+		promhttp.HandlerOpts{
+			// Opt into OpenMetrics to support exemplars.
+			EnableOpenMetrics: true,
+		},
+	))
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil))
 }
