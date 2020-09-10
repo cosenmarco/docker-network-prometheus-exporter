@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cosenmarco/docker-prometheus-exporter/configuration"
@@ -94,7 +95,7 @@ func collectInfo(config *configuration.Configuration, cli *client.Client, ctx *c
 	}
 
 	for _, container := range containers {
-		name := container.Names[0]
+		name := strings.TrimPrefix(container.Names[0], "/")
 		var err error
 
 		inspection, err := cli.ContainerInspect(*ctx, container.ID)
@@ -104,7 +105,7 @@ func collectInfo(config *configuration.Configuration, cli *client.Client, ctx *c
 			continue
 		}
 
-		if inspection.State.Running {
+		if inspection.State.Status == "running" {
 			healthGauge, err := healthStateMetric.GetMetricWithLabelValues(name)
 			if err != nil {
 				log.Println(fmt.Errorf("can't get health gauge for container %v: %v",
